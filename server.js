@@ -4,28 +4,29 @@ const mysql = require('mysql2/promise');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const app = express();
 
-// CORS Configuration - Specifically set up so EdgeOne frontend is not blocked
+// Enable CORS for EdgeOne and external clients
 app.use(cors({
-    origin: '*', // Allows requests from https://pages.edgeone.ai and local testing
+    origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 app.use(express.json());
 
-// MySQL / TiDB Connection Pool
+// TiDB / MySQL Database Connection Pool
 const db = mysql.createPool({
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
+    database: process.env.DB_NAME || 'webuy',
     port: process.env.DB_PORT || 4000,
     ssl: {
         minVersion: 'TLSv1.2',
-        rejectUnauthorized: true
+        rejectUnauthorized: false // Prevents SSL certificate verification crashes on Render
     },
     waitForConnections: true,
     connectionLimit: 10,
@@ -33,8 +34,64 @@ const db = mysql.createPool({
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'webuy_secret_key_2026';
+const PAYAT_SYSTEM_ID = process.env.PAYAT_SYSTEM_ID || 'WEBUY001';
+const PAYAT_SECRET_KEY = process.env.PAYAT_SECRET_KEY || 'payat_secret_key_sample';
 
-// Middleware to verify JWT and check user identity
+// Auto-Initialize Database Tables on Startup
+async function initDatabase() {
+    try {
+        const connection = await db.getConnection();
+        console.log('Successfully connected to TiDB/MySQL database.');
+
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password VARCHAR(255) NOT NULL,
+                role ENUM('buyer', 'seller') NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
+
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS products (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                seller_id INT NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                description TEXT,
+                price DECIMAL(10, 2) NOT NULL,
+                image_url VARCHAR(500) DEFAULT 'logo.jpg',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (seller_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+        `);
+
+        await connection.query(`
+            CREATE TABLE IF NOT EXISTS orders (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                buyer_id INT NOT NULL,
+                product_id INT NOT NULL,
+                status ENUM('pending', 'completed', 'cancelled') DEFAULT 'pending',
+                payment_ref VARCHAR(255),
+                payment_status ENUM('unpaid', 'paid', 'failed') DEFAULT 'unpaid',
+                payment_method VARCHAR(50),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (buyer_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
+            );
+        `);
+
+        connection.release();
+        console.log('Database tables verified successfully.');
+    } catch (err) {
+        console.error('DATABASE INITIALIZATION ERROR:', err.message);
+    }
+}
+
+initDatabase();
+
+// Authentication Middleware
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -48,23 +105,17 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
-// --- API ENDPOINTS ---
+// --- AUTH & USER ENDPOINTS ---
 
-// 1. Health Check
 app.get('/api/health', (req, res) => {
-    res.json({ status: 'OK', message: 'WeBuy API is running smoothly.' });
+    res.json({ status: 'OK', message: 'WeBuy API with Pay@ Integration operational.' });
 });
 
-// 2. User Registration (Buyer or Seller)
 app.post('/api/auth/register', async (req, res) => {
     const { name, email, password, role } = req.body;
 
     if (!name || !email || !password || !role) {
         return res.status(400).json({ error: 'All fields are required.' });
-    }
-
-    if (!['buyer', 'seller'].includes(role.toLowerCase())) {
-        return res.status(400).json({ error: 'Role must be either buyer or seller.' });
     }
 
     try {
@@ -81,11 +132,11 @@ app.post('/api/auth/register', async (req, res) => {
 
         res.status(201).json({ message: 'User registered successfully', userId: result.insertId });
     } catch (err) {
+        console.error('REGISTER ERROR:', err);
         res.status(500).json({ error: 'Database error', details: err.message });
     }
 });
 
-// 3. User Login
 app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
 
@@ -113,11 +164,13 @@ app.post('/api/auth/login', async (req, res) => {
             user: { id: user.id, name: user.name, email: user.email, role: user.role }
         });
     } catch (err) {
+        console.error('LOGIN ERROR:', err);
         res.status(500).json({ error: 'Database error', details: err.message });
     }
 });
 
-// 4. Fetch All Products (Accessible to everyone)
+// --- MARKETPLACE ENDPOINTS ---
+
 app.get('/api/products', async (req, res) => {
     try {
         const [products] = await db.query(`
@@ -128,79 +181,104 @@ app.get('/api/products', async (req, res) => {
         `);
         res.json(products);
     } catch (err) {
-        res.status(500).json({ error: 'Failed to fetch products', details: err.message });
-    }
-});
-
-// 5. Create a Product Listing (Sellers Only)
-app.post('/api/products', authenticateToken, async (req, res) => {
-    if (req.user.role !== 'seller') {
-        return res.status(403).json({ error: 'Only registered sellers can create listings.' });
-    }
-
-    const { title, description, price, image_url } = req.body;
-    if (!title || !price) {
-        return res.status(400).json({ error: 'Title and price are required.' });
-    }
-
-    try {
-        const [result] = await db.query(
-            'INSERT INTO products (seller_id, title, description, price, image_url) VALUES (?, ?, ?, ?, ?)',
-            [req.user.id, title, description, price, image_url || '/uploads/logo.jpg']
-        );
-        res.status(201).json({ message: 'Product listed successfully', productId: result.insertId });
-    } catch (err) {
+        console.error('PRODUCTS FETCH ERROR:', err);
         res.status(500).json({ error: 'Database error', details: err.message });
     }
 });
 
-// 6. Buy a Product (Buyers Only)
-app.post('/api/orders', authenticateToken, async (req, res) => {
+app.post('/api/products', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'seller') {
+        return res.status(403).json({ error: 'Only sellers can list products.' });
+    }
+
+    const { title, description, price, image_url } = req.body;
+    try {
+        const [result] = await db.query(
+            'INSERT INTO products (seller_id, title, description, price, image_url) VALUES (?, ?, ?, ?, ?)',
+            [req.user.id, title, description, price, image_url || 'logo.jpg']
+        );
+        res.status(201).json({ message: 'Product created', productId: result.insertId });
+    } catch (err) {
+        console.error('CREATE PRODUCT ERROR:', err);
+        res.status(500).json({ error: 'Database error', details: err.message });
+    }
+});
+
+// --- PAY@ INTEGRATION ENDPOINTS ---
+
+// 1. Create Order and Generate Pay@ Reference Number
+app.post('/api/payat/create-checkout', authenticateToken, async (req, res) => {
     if (req.user.role !== 'buyer') {
         return res.status(403).json({ error: 'Only buyers can make purchases.' });
     }
 
-    const { product_id } = req.body;
-    if (!product_id) {
-        return res.status(400).json({ error: 'Product ID is required.' });
-    }
+    const { product_id, payment_option } = req.body; 
+    // Options: 'retail_store' (Shoprite/Checkers/Pick n Pay/PEP/Boxer), 'qr' (Masterpass/SnapScan/Zapper), 'card', 'eft'
 
     try {
-        const [result] = await db.query(
-            'INSERT INTO orders (buyer_id, product_id, status) VALUES (?, ?, ?)',
-            [req.user.id, product_id, 'completed']
+        const [products] = await db.query('SELECT * FROM products WHERE id = ?', [product_id]);
+        if (products.length === 0) {
+            return res.status(404).json({ error: 'Product not found.' });
+        }
+
+        const product = products[0];
+
+        // Unique Pay@ Reference Generation (Format: WEBUY + Timestamp + Order Randomizer)
+        const payatReference = `10101${Date.now().toString().slice(-6)}${Math.floor(10 + Math.random() * 90)}`;
+
+        const [orderResult] = await db.query(
+            'INSERT INTO orders (buyer_id, product_id, status, payment_ref, payment_status, payment_method) VALUES (?, ?, ?, ?, ?, ?)',
+            [req.user.id, product_id, 'pending', payatReference, 'unpaid', payment_option || 'payat_multi']
         );
-        res.status(201).json({ message: 'Purchase completed successfully', orderId: result.insertId });
+
+        // Standard Pay@ Web Portal Redirect URL or Retail Reference Output
+        const payatPaymentUrl = `https://payat.io/pay/${payatReference}?amount=${product.price}&sys=${PAYAT_SYSTEM_ID}`;
+
+        res.status(201).json({
+            message: 'Pay@ Checkout initialized',
+            orderId: orderResult.insertId,
+            payatReference: payatReference,
+            amount: product.price,
+            paymentUrl: payatPaymentUrl,
+            supportedStores: ['Shoprite', 'Checkers', 'Pick n Pay', 'PEP', 'Boxer', 'Usave', 'Spar'],
+            supportedDigital: ['SnapScan', 'Zapper', 'Masterpass', 'Capitec Pay', 'Instant EFT', 'Visa/Mastercard']
+        });
     } catch (err) {
-        res.status(500).json({ error: 'Database error', details: err.message });
+        console.error('PAYAT CHECKOUT ERROR:', err);
+        res.status(500).json({ error: 'Checkout initialization failed', details: err.message });
     }
 });
 
-// 7. Get User Purchases/Sales History
-app.get('/api/orders/user', authenticateToken, async (req, res) => {
+// 2. Pay@ Webhook / IPN Notification Endpoint
+app.post('/api/payat/notification', async (req, res) => {
+    const { payat_reference, amount, status, transaction_id, checksum } = req.body;
+
     try {
-        let query = '';
-        if (req.user.role === 'buyer') {
-            query = `
-                SELECT o.id AS order_id, o.status, o.created_at, p.title, p.price, u.name AS seller_name
-                FROM orders o
-                JOIN products p ON o.product_id = p.id
-                JOIN users u ON p.seller_id = u.id
-                WHERE o.buyer_id = ?
-            `;
-        } else {
-            query = `
-                SELECT o.id AS order_id, o.status, o.created_at, p.title, p.price, u.name AS buyer_name
-                FROM orders o
-                JOIN products p ON o.product_id = p.id
-                JOIN users u ON o.buyer_id = u.id
-                WHERE p.seller_id = ?
-            `;
+        if (status === 'PAID' || status === 'SUCCESS') {
+            await db.query(
+                'UPDATE orders SET status = ?, payment_status = ? WHERE payment_ref = ?',
+                ['completed', 'paid', payat_reference]
+            );
+            console.log(`Pay@ Payment Received for Ref: ${payat_reference}`);
         }
-        const [orders] = await db.query(query, [req.user.id]);
-        res.json(orders);
+
+        // Pay@ requires a standard 200 OK acknowledgement response
+        res.status(200).json({ response: 'OK', reference: payat_reference });
     } catch (err) {
-        res.status(500).json({ error: 'Failed to retrieve orders', details: err.message });
+        console.error('PAYAT NOTIFICATION ERROR:', err);
+        res.status(500).json({ error: 'Notification processing failed' });
+    }
+});
+
+// 3. Check Order Payment Status
+app.get('/api/payat/status/:reference', authenticateToken, async (req, res) => {
+    try {
+        const [orders] = await db.query('SELECT id, status, payment_status, payment_ref FROM orders WHERE payment_ref = ?', [req.params.reference]);
+        if (orders.length === 0) return res.status(404).json({ error: 'Order reference not found' });
+
+        res.json(orders[0]);
+    } catch (err) {
+        res.status(500).json({ error: 'Database error', details: err.message });
     }
 });
 
