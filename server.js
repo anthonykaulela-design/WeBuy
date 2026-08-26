@@ -406,5 +406,31 @@ app.get('/api/payat/status/:reference', authenticateToken, async (req, res) => {
     }
 });
 
+// --- GET SINGLE PRODUCT BY ID (FOR DIRECT SHARE LINKS) ---
+app.get('/api/products/:id', async (req, res) => {
+    try {
+        const [products] = await db.query(`
+            SELECT p.id, p.title, p.description, p.price, p.created_at, u.name AS seller_name 
+            FROM products p 
+            JOIN users u ON p.seller_id = u.id 
+            WHERE p.id = ?
+        `, [req.params.id]);
+
+        if (products.length === 0) {
+            return res.status(404).json({ error: 'Product not found.' });
+        }
+
+        const product = products[0];
+        const [imgs] = await db.query('SELECT image_url FROM product_images WHERE product_id = ?', [product.id]);
+        product.images = imgs.map(i => i.image_url);
+        if (product.images.length === 0) product.images = ['logo.jpg'];
+
+        res.json(product);
+    } catch (err) {
+        console.error('FETCH SINGLE PRODUCT ERROR:', err);
+        res.status(500).json({ error: 'Database error', details: err.message });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`WeBuy API running on port ${PORT}`));
