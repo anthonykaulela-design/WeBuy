@@ -14,11 +14,11 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-// Increase body payload limit to 50MB to accept up to 10 Base64 device images
+// Body payload limit set to 50MB for image uploads
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// TiDB / MySQL Database Connection Pool
+// Database Connection Pool
 const db = mysql.createPool({
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
@@ -37,7 +37,7 @@ const db = mysql.createPool({
 const JWT_SECRET = process.env.JWT_SECRET || 'webuy_secret_key_2026';
 const PAYAT_SYSTEM_ID = process.env.PAYAT_SYSTEM_ID || 'WEBUY001';
 
-// Automatically create and update database tables on startup
+// Automatically create and migrate database tables
 async function initDatabase() {
     try {
         const conn = await db.getConnection();
@@ -75,12 +75,9 @@ async function initDatabase() {
             );
         `);
 
-        // Upgrade image_url column to LONGTEXT if table was previously created with TEXT
         try {
             await conn.query(`ALTER TABLE product_images MODIFY image_url LONGTEXT;`);
-        } catch (e) {
-            // Column is already LONGTEXT or table was just created
-        }
+        } catch (e) {}
 
         await conn.query(`
             CREATE TABLE IF NOT EXISTS cart_items (
@@ -103,10 +100,36 @@ async function initDatabase() {
                 payment_ref VARCHAR(255),
                 payment_status ENUM('unpaid', 'paid', 'failed') DEFAULT 'unpaid',
                 payment_method VARCHAR(50),
+                full_name VARCHAR(255),
+                company_name VARCHAR(255),
+                address TEXT,
+                city VARCHAR(100),
+                province VARCHAR(100),
+                postal_code VARCHAR(20),
+                phone_number VARCHAR(50),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (buyer_id) REFERENCES users(id) ON DELETE CASCADE
             );
         `);
+
+        // Migration logic for existing installations
+        const deliveryColumns = [
+            'ALTER TABLE orders ADD COLUMN full_name VARCHAR(255);',
+            'ALTER TABLE orders ADD COLUMN company_name VARCHAR(255);',
+            'ALTER TABLE orders ADD COLUMN address TEXT;',
+            'ALTER TABLE orders ADD COLUMN city VARCHAR(100);',
+            'ALTER TABLE orders ADD COLUMN province VARCHAR(100);',
+            'ALTER TABLE orders ADD COLUMN postal_code VARCHAR(20);',
+            'ALTER TABLE orders ADD COLUMN phone_number VARCHAR(50);'
+        ];
+
+        for (let colQuery of deliveryColumns) {
+            try {
+                await conn.query(colQuery);
+            } catch (e) {
+                // Column already exists
+            }
+        }
 
         await conn.query(`
             CREATE TABLE IF NOT EXISTS order_items (
@@ -121,7 +144,7 @@ async function initDatabase() {
         `);
 
         conn.release();
-        console.log('Database tables verified successfully.');
+        console.log('Database tables and schema verified.');
     } catch (err) {
         console.error('DATABASE INIT ERROR:', err.message);
     }
@@ -231,6 +254,31 @@ app.get('/api/products', async (req, res) => {
     }
 });
 
+app.get('/api/products/:id', async (req, res) => {
+    try {
+        const [products] = await db.query(`
+            SELECT p.id, p.title, p.description, p.price, p.created_at, u.name AS seller_name 
+            FROM products p 
+            JOIN users u ON p.seller_id = u.id 
+            WHERE p.id = ?
+        `, [req.params.id]);
+
+        if (products.length === 0) {
+            return res.status(404).json({ error: 'Product not found.' });
+        }
+
+        const product = products[0];
+        const [imgs] = await db.query('SELECT image_url FROM product_images WHERE product_id = ?', [product.id]);
+        product.images = imgs.map(i => i.image_url);
+        if (product.images.length === 0) product.images = ['logo.jpg'];
+
+        res.json(product);
+    } catch (err) {
+        console.error('FETCH SINGLE PRODUCT ERROR:', err);
+        res.status(500).json({ error: 'Database error', details: err.message });
+    }
+});
+
 app.post('/api/products', authenticateToken, async (req, res) => {
     if (req.user.role !== 'seller') {
         return res.status(403).json({ error: 'Only sellers can list products.' });
@@ -249,7 +297,6 @@ app.post('/api/products', authenticateToken, async (req, res) => {
         );
         const productId = pRes.insertId;
 
-        // Limit to maximum 10 device image uploads
         const imgList = Array.isArray(images) && images.length > 0 ? images.slice(0, 10) : ['logo.jpg'];
         for (let img of imgList) {
             if (img && img.trim() !== '') {
@@ -319,14 +366,18 @@ app.delete('/api/cart/:id', authenticateToken, async (req, res) => {
     }
 });
 
-// --- PAY@ PAYMENT ENDPOINTS ---
+// --- CHECKOUT & PAY@ PAYMENT ENDPOINTS ---
 
 app.post('/api/payat/checkout', authenticateToken, async (req, res) => {
     if (req.user.role !== 'buyer') {
         return res.status(403).json({ error: 'Only buyers can perform checkout.' });
     }
 
-    const { payment_method } = req.body;
+    const { payment_method, full_name, company_name, address, city, province, postal_code, phone_number } = req.body;
+
+    if (!full_name || !address || !city || !province || !postal_code || !phone_number) {
+        return res.status(400).json({ error: 'Please provide all required delivery details.' });
+    }
 
     try {
         const [cartItems] = await db.query(`
@@ -337,15 +388,31 @@ app.post('/api/payat/checkout', authenticateToken, async (req, res) => {
         `, [req.user.id]);
 
         if (cartItems.length === 0) {
-            return res.status(400).json({ error: 'Cart is empty.' });
+            return res.status(400).json({ error: 'Your cart is empty.' });
         }
 
         let totalAmount = cartItems.reduce((sum, item) => sum + (parseFloat(item.price) * item.quantity), 0);
         const payatRef = `10101${Date.now().toString().slice(-6)}${Math.floor(10 + Math.random() * 90)}`;
 
         const [orderRes] = await db.query(
-            'INSERT INTO orders (buyer_id, total_amount, status, payment_ref, payment_status, payment_method) VALUES (?, ?, ?, ?, ?, ?)',
-            [req.user.id, totalAmount, 'pending', payatRef, 'unpaid', payment_method || 'payat_retail']
+            `INSERT INTO orders 
+            (buyer_id, total_amount, status, payment_ref, payment_status, payment_method, full_name, company_name, address, city, province, postal_code, phone_number) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                req.user.id,
+                totalAmount,
+                'pending',
+                payatRef,
+                'unpaid',
+                payment_method || 'retail_store',
+                full_name,
+                company_name || null,
+                address,
+                city,
+                province,
+                postal_code,
+                phone_number
+            ]
         );
         const orderId = orderRes.insertId;
 
@@ -356,11 +423,11 @@ app.post('/api/payat/checkout', authenticateToken, async (req, res) => {
             );
         }
 
-        // Clear user cart upon successful order creation
+        // Clear cart upon order creation
         await db.query('DELETE FROM cart_items WHERE buyer_id = ?', [req.user.id]);
 
         res.status(201).json({
-            message: 'Pay@ Order Generated',
+            message: 'Order and Pay@ Payment reference generated successfully',
             orderId,
             payatReference: payatRef,
             totalAmount: totalAmount.toFixed(2),
@@ -394,7 +461,7 @@ app.post('/api/payat/notification', async (req, res) => {
 app.get('/api/payat/status/:reference', authenticateToken, async (req, res) => {
     try {
         const [orders] = await db.query(
-            'SELECT id, total_amount, status, payment_status, payment_ref FROM orders WHERE payment_ref = ?',
+            'SELECT id, total_amount, status, payment_status, payment_ref, full_name, city FROM orders WHERE payment_ref = ?',
             [req.params.reference]
         );
 
@@ -402,32 +469,6 @@ app.get('/api/payat/status/:reference', authenticateToken, async (req, res) => {
 
         res.json(orders[0]);
     } catch (err) {
-        res.status(500).json({ error: 'Database error', details: err.message });
-    }
-});
-
-// --- GET SINGLE PRODUCT BY ID (FOR DIRECT SHARE LINKS) ---
-app.get('/api/products/:id', async (req, res) => {
-    try {
-        const [products] = await db.query(`
-            SELECT p.id, p.title, p.description, p.price, p.created_at, u.name AS seller_name 
-            FROM products p 
-            JOIN users u ON p.seller_id = u.id 
-            WHERE p.id = ?
-        `, [req.params.id]);
-
-        if (products.length === 0) {
-            return res.status(404).json({ error: 'Product not found.' });
-        }
-
-        const product = products[0];
-        const [imgs] = await db.query('SELECT image_url FROM product_images WHERE product_id = ?', [product.id]);
-        product.images = imgs.map(i => i.image_url);
-        if (product.images.length === 0) product.images = ['logo.jpg'];
-
-        res.json(product);
-    } catch (err) {
-        console.error('FETCH SINGLE PRODUCT ERROR:', err);
         res.status(500).json({ error: 'Database error', details: err.message });
     }
 });
