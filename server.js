@@ -4,6 +4,7 @@ const mysql = require('mysql2/promise');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
 
 const app = express();
 
@@ -36,6 +37,113 @@ const db = mysql.createPool({
 
 const JWT_SECRET = process.env.JWT_SECRET || 'webuy_secret_key_2026';
 const PAYAT_SYSTEM_ID = process.env.PAYAT_SYSTEM_ID || 'WEBUY001';
+
+// Email Transporter Configuration (SMTP)
+const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: parseInt(process.env.SMTP_PORT || '587'),
+    secure: false, // true for 465, false for other ports
+    auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS
+    }
+});
+
+// Helper function to send email notification to seller
+async function sendSellerPaymentNotification(payatReference) {
+    try {
+        // Retrieve order details, purchased products, and seller contact info
+        const [rows] = await db.query(`
+            SELECT 
+                o.id AS order_id,
+                o.payment_ref,
+                o.total_amount,
+                o.full_name AS buyer_name,
+                o.company_name AS buyer_company,
+                o.address AS buyer_address,
+                o.city AS buyer_city,
+                o.province AS buyer_province,
+                o.postal_code AS buyer_postal,
+                o.phone_number AS buyer_phone,
+                oi.quantity,
+                oi.price AS item_price,
+                p.title AS product_title,
+                u.email AS seller_email,
+                u.name AS seller_name
+            FROM orders o
+            JOIN order_items oi ON o.id = oi.order_id
+            JOIN products p ON oi.product_id = p.id
+            JOIN users u ON p.seller_id = u.id
+            WHERE o.payment_ref = ?
+        `, [payatReference]);
+
+        if (rows.length === 0) return;
+
+        // Group items by seller in case an order contains products from multiple sellers
+        const sellerMap = {};
+        for (let row of rows) {
+            if (!sellerMap[row.seller_email]) {
+                sellerMap[row.seller_email] = {
+                    sellerName: row.seller_name,
+                    buyerName: row.buyer_name,
+                    buyerCompany: row.buyer_company,
+                    buyerAddress: `${row.buyer_address}, ${row.buyer_city}, ${row.buyer_province}, ${row.buyer_postal}`,
+                    buyerPhone: row.buyer_phone,
+                    paymentRef: row.payment_ref,
+                    items: []
+                };
+            }
+            sellerMap[row.seller_email].items.push({
+                title: row.product_title,
+                quantity: row.quantity,
+                price: parseFloat(row.item_price).toFixed(2)
+            });
+        }
+
+        // Send email to each seller
+        for (let sellerEmail in sellerMap) {
+            const data = sellerMap[sellerEmail];
+            
+            let itemsHtml = data.items.map(item => 
+                `<li><strong>${item.title}</strong> - Quantity: ${item.quantity} @ R ${item.price} each</li>`
+            ).join('');
+
+            const mailOptions = {
+                from: `"WeBuy Marketplace" <${process.env.SMTP_USER || 'no-reply@webuy.co.za'}>`,
+                to: sellerEmail,
+                subject: `Order Confirmed & Paid - Pay@ Ref: ${data.paymentRef}`,
+                html: `
+                    <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+                        <h2 style="color: #0b55b2;">Good news, ${data.sellerName}!</h2>
+                        <p>Your item(s) listed on <strong>WeBuy</strong> have been ordered and payment has been confirmed.</p>
+                        
+                        <div style="background: #eef7e8; border: 1px solid #68b819; padding: 15px; border-radius: 6px; margin: 15px 0;">
+                            <h3 style="margin-top: 0; color: #68b819;">Payment Information</h3>
+                            <p><strong>Pay@ Reference:</strong> <span style="font-size: 1.2em; color: #0b55b2;">${data.paymentRef}</span></p>
+                            <p><strong>Payment Status:</strong> Paid / Confirmed</p>
+                        </div>
+
+                        <h3>Ordered Items</h3>
+                        <ul>${itemsHtml}</ul>
+
+                        <h3>Delivery Details</h3>
+                        <p><strong>Recipient:</strong> ${data.buyerName} ${data.buyerCompany ? `(${data.buyerCompany})` : ''}</p>
+                        <p><strong>Address:</strong> ${data.buyerAddress}</p>
+                        <p><strong>Contact Phone:</strong> ${data.buyerPhone}</p>
+
+                        <hr style="border: none; border-top: 1px solid #ccc; margin: 20px 0;">
+                        <p style="font-size: 0.85em; color: #777;">Please prepare the package for delivery. Thank you for selling on WeBuy!</p>
+                    </div>
+                `
+            };
+
+            await transporter.sendMail(mailOptions);
+            console.log(`Notification email sent to seller: ${sellerEmail}`);
+        }
+    } catch (err) {
+        console.error('FAILED TO SEND SELLER EMAIL:', err.message);
+    }
+}
 
 // Automatically create and migrate database tables
 async function initDatabase() {
@@ -112,7 +220,6 @@ async function initDatabase() {
             );
         `);
 
-        // Migration logic for existing installations
         const deliveryColumns = [
             'ALTER TABLE orders ADD COLUMN full_name VARCHAR(255);',
             'ALTER TABLE orders ADD COLUMN company_name VARCHAR(255);',
@@ -126,9 +233,7 @@ async function initDatabase() {
         for (let colQuery of deliveryColumns) {
             try {
                 await conn.query(colQuery);
-            } catch (e) {
-                // Column already exists
-            }
+            } catch (e) {}
         }
 
         await conn.query(`
@@ -439,6 +544,7 @@ app.post('/api/payat/checkout', authenticateToken, async (req, res) => {
     }
 });
 
+// Pay@ Webhook Notification Endpoint (Triggers Seller Email)
 app.post('/api/payat/notification', async (req, res) => {
     const { payat_reference, status } = req.body;
 
@@ -449,6 +555,9 @@ app.post('/api/payat/notification', async (req, res) => {
                 ['completed', 'paid', payat_reference]
             );
             console.log(`Pay@ Payment confirmed for reference: ${payat_reference}`);
+
+            // Dispatch notification email to seller(s)
+            await sendSellerPaymentNotification(payat_reference);
         }
 
         res.status(200).json({ response: 'OK', reference: payat_reference });
