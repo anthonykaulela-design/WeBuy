@@ -3,11 +3,11 @@ const express = require('express');
 const cors = require('cors');
 const mysql = require('mysql2/promise');
 const bcrypt = require('bcryptjs');
-const jwt = require('jwt-simple');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 
-// Increase payload limits to handle Base64 certificate and image uploads
+// Increase payload limits to handle Base64 certificate and multi-image uploads
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(cors());
@@ -27,7 +27,7 @@ const db = mysql.createPool({
     }
 });
 
-// Test DB Connection
+// Test Database Connection
 db.getConnection()
     .then(conn => {
         console.log('Successfully connected to TiDB/MySQL database');
@@ -37,13 +37,32 @@ db.getConnection()
         console.error('Database connection error:', err.message);
     });
 
-// API Base Health Check
+// Health Check
 app.get('/api', (req, res) => {
     res.json({ message: 'WeBuy API is running smoothly' });
 });
 
 // ==========================================
-// USER REGISTRATION ENDPOINT (POST /api/register)
+// AUTHENTICATION MIDDLEWARE
+// ==========================================
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) return res.status(401).json({ error: 'Access token required' });
+
+    try {
+        const secret = process.env.JWT_SECRET || 'fallback_secret';
+        const decoded = jwt.verify(token, secret);
+        req.user = decoded;
+        next();
+    } catch (err) {
+        return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+};
+
+// ==========================================
+// USER REGISTRATION (POST /api/register)
 // ==========================================
 app.post('/api/register', async (req, res) => {
     try {
@@ -61,7 +80,6 @@ app.post('/api/register', async (req, res) => {
             return res.status(400).json({ error: 'Name, email, and password are required.' });
         }
 
-        // Check if user already exists
         const [existingUsers] = await db.execute(
             'SELECT id FROM users WHERE email = ?', 
             [email]
@@ -71,12 +89,10 @@ app.post('/api/register', async (req, res) => {
             return res.status(400).json({ error: 'Email is already registered.' });
         }
 
-        // Hash password
         const hashedPassword = await bcrypt.hash(password, 10);
         const userRole = role === 'seller' ? 'seller' : 'buyer';
         const isTermsAccepted = userRole === 'seller' ? 1 : 0;
 
-        // Insert new user into database
         const [result] = await db.execute(
             `INSERT INTO users 
             (name, email, password, role, business_cert, delivery_preference, pricing_preference, terms_accepted) 
@@ -105,7 +121,7 @@ app.post('/api/register', async (req, res) => {
 });
 
 // ==========================================
-// USER LOGIN ENDPOINT (POST /api/login)
+// USER LOGIN (POST /api/login)
 // ==========================================
 app.post('/api/login', async (req, res) => {
     try {
@@ -123,7 +139,11 @@ app.post('/api/login', async (req, res) => {
         }
 
         const secret = process.env.JWT_SECRET || 'fallback_secret';
-        const token = jwt.encode({ id: user.id, email: user.email, role: user.role }, secret);
+        const token = jwt.sign(
+            { id: user.id, email: user.email, role: user.role }, 
+            secret, 
+            { expiresIn: '7d' }
+        );
 
         res.json({
             token,
@@ -141,23 +161,6 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
-// Authentication Middleware
-const authenticateToken = (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-
-    if (!token) return res.status(401).json({ error: 'Access token required' });
-
-    try {
-        const secret = process.env.JWT_SECRET || 'fallback_secret';
-        const decoded = jwt.decode(token, secret);
-        req.user = decoded;
-        next();
-    } catch (err) {
-        return res.status(403).json({ error: 'Invalid or expired token' });
-    }
-};
-
 // ==========================================
 // PRODUCTS ENDPOINTS
 // ==========================================
@@ -172,7 +175,6 @@ app.get('/api/products', async (req, res) => {
             ORDER BY p.id DESC
         `);
 
-        // Format images array
         const products = rows.map(p => ({
             ...p,
             images: typeof p.images === 'string' ? JSON.parse(p.images) : p.images || []
@@ -185,7 +187,7 @@ app.get('/api/products', async (req, res) => {
     }
 });
 
-// Get single product
+// Get single product details
 app.get('/api/products/:id', async (req, res) => {
     try {
         const [rows] = await db.execute(`
@@ -206,7 +208,7 @@ app.get('/api/products/:id', async (req, res) => {
     }
 });
 
-// Create product (Seller only)
+// Post a product (Seller only)
 app.post('/api/products', authenticateToken, async (req, res) => {
     try {
         if (req.user.role !== 'seller') {
@@ -216,7 +218,7 @@ app.post('/api/products', authenticateToken, async (req, res) => {
         const { title, description, price, weight, images } = req.body;
         const sellerId = req.user.id;
 
-        // Apply R50 fee adjustment if seller selected pricing_preference = 'add'
+        // Auto-add R50 listing fee if seller opted to add fee on top during registration
         const [sellerInfo] = await db.execute('SELECT pricing_preference FROM users WHERE id = ?', [sellerId]);
         let finalPrice = parseFloat(price);
 
@@ -242,6 +244,7 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 // CART ENDPOINTS
 // ==========================================
 
+// Get user cart items
 app.get('/api/cart', authenticateToken, async (req, res) => {
     try {
         const [rows] = await db.execute(`
@@ -250,12 +253,19 @@ app.get('/api/cart', authenticateToken, async (req, res) => {
             JOIN products p ON c.product_id = p.id 
             WHERE c.user_id = ?
         `, [req.user.id]);
-        res.json(rows);
+        
+        const cartItems = rows.map(item => ({
+            ...item,
+            images: typeof item.images === 'string' ? JSON.parse(item.images) : item.images || []
+        }));
+
+        res.json(cartItems);
     } catch (err) {
         res.status(500).json({ error: 'Failed to load cart.' });
     }
 });
 
+// Add product to cart
 app.post('/api/cart', authenticateToken, async (req, res) => {
     try {
         const { product_id } = req.body;
@@ -274,6 +284,7 @@ app.post('/api/cart', authenticateToken, async (req, res) => {
     }
 });
 
+// Delete cart item
 app.delete('/api/cart/:id', authenticateToken, async (req, res) => {
     try {
         await db.execute('DELETE FROM cart WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
@@ -286,15 +297,12 @@ app.delete('/api/cart/:id', authenticateToken, async (req, res) => {
 // ==========================================
 // PAYAT CHECKOUT ENDPOINT
 // ==========================================
-
 app.post('/api/checkout/payat', authenticateToken, async (req, res) => {
     try {
         const { full_name, address, city, province, postal_code, phone, payment_option } = req.body;
 
-        // Generate PayAt Reference Number
         const payatReference = 'PAYAT-' + Math.floor(10000000 + Math.random() * 90000000);
 
-        // Clear cart after payment intent creation
         await db.execute('DELETE FROM cart WHERE user_id = ?', [req.user.id]);
 
         res.json({
@@ -307,8 +315,8 @@ app.post('/api/checkout/payat', authenticateToken, async (req, res) => {
     }
 });
 
-// Start Server
+// Start Express Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
