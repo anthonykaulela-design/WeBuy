@@ -156,20 +156,20 @@ async function initDatabase() {
                 password VARCHAR(255) NOT NULL,
                 role ENUM('buyer', 'seller') NOT NULL,
                 business_cert LONGTEXT,
-                needs_platform_delivery BOOLEAN DEFAULT FALSE,
-                tc_accepted BOOLEAN DEFAULT FALSE,
+                delivery_option ENUM('self', 'platform') DEFAULT 'self',
+                tc_accepted TINYINT(1) DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
 
-        // Migration safety for legacy user tables
-        const userMigrations = [
+        // Migration for existing users table
+        const sellerColumns = [
             'ALTER TABLE users ADD COLUMN business_cert LONGTEXT;',
-            'ALTER TABLE users ADD COLUMN needs_platform_delivery BOOLEAN DEFAULT FALSE;',
-            'ALTER TABLE users ADD COLUMN tc_accepted BOOLEAN DEFAULT FALSE;'
+            "ALTER TABLE users ADD COLUMN delivery_option ENUM('self', 'platform') DEFAULT 'self';",
+            'ALTER TABLE users ADD COLUMN tc_accepted TINYINT(1) DEFAULT 0;'
         ];
-        for (let query of userMigrations) {
-            try { await conn.query(query); } catch (e) {}
+        for (let colQuery of sellerColumns) {
+            try { await conn.query(colQuery); } catch (e) {}
         }
 
         await conn.query(`
@@ -279,36 +279,31 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
-// --- AUTHENTICATION ENDPOINTS ---
+// --- AUTHENTICATION & SELLER REGISTRATION ---
 
 app.get('/api/health', (req, res) => {
     res.json({ status: 'OK', message: 'WeBuy API operational.' });
 });
 
-// Platform Terms & Pricing Info
-app.get('/api/terms', (req, res) => {
-    res.json({
-        deliveryFeePerKg: 400.00,
-        adFeePerProductSold: 50.00,
-        termsText: "All sellers agree to a platform advertising fee of R50 per product sold. If platform-handled delivery is requested, a rate of R400 per KG applies."
-    });
-});
-
 app.post('/api/auth/register', async (req, res) => {
-    const { name, email, password, role, business_cert, needs_platform_delivery, tc_accepted } = req.body;
+    const { name, email, password, role, business_cert, delivery_option, tc_accepted } = req.body;
 
     if (!name || !email || !password || !role) {
-        return res.status(400).json({ error: 'All primary fields are required.' });
+        return res.status(400).json({ error: 'Name, email, password, and role are required.' });
     }
 
-    const normalizedRole = role.toLowerCase();
+    const userRole = role.toLowerCase();
 
-    if (normalizedRole === 'seller') {
+    // Verification for seller registration rules
+    if (userRole === 'seller') {
         if (!business_cert) {
-            return res.status(400).json({ error: 'Business registration certificate is required for sellers.' });
+            return res.status(400).json({ error: 'Sellers must provide a business registration certificate.' });
+        }
+        if (!delivery_option || !['self', 'platform'].includes(delivery_option)) {
+            return res.status(400).json({ error: 'Please specify if you will handle delivery yourself or require platform delivery handling (R400/KG).' });
         }
         if (!tc_accepted) {
-            return res.status(400).json({ error: 'Sellers must accept the Terms and Conditions (R50 ad fee per product sold & delivery terms).' });
+            return res.status(400).json({ error: 'You must accept the terms and conditions (including the R50 advertising fee per item sold).' });
         }
     }
 
@@ -319,13 +314,17 @@ app.post('/api/auth/register', async (req, res) => {
         }
 
         const hashedPassword = await bcrypt.hash(password, 10);
-        const deliveryPref = needs_platform_delivery ? true : false;
-        const acceptedTC = tc_accepted ? true : false;
-        const certData = normalizedRole === 'seller' ? business_cert : null;
-
         const [result] = await db.query(
-            'INSERT INTO users (name, email, password, role, business_cert, needs_platform_delivery, tc_accepted) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            [name, email, hashedPassword, normalizedRole, certData, deliveryPref, acceptedTC]
+            'INSERT INTO users (name, email, password, role, business_cert, delivery_option, tc_accepted) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [
+                name, 
+                email, 
+                hashedPassword, 
+                userRole, 
+                userRole === 'seller' ? business_cert : null, 
+                userRole === 'seller' ? delivery_option : 'self', 
+                userRole === 'seller' ? (tc_accepted ? 1 : 0) : 0
+            ]
         );
 
         res.status(201).json({ message: 'User registered successfully', userId: result.insertId });
@@ -359,13 +358,7 @@ app.post('/api/auth/login', async (req, res) => {
         res.json({
             message: 'Login successful',
             token,
-            user: { 
-                id: user.id, 
-                name: user.name, 
-                email: user.email, 
-                role: user.role,
-                needs_platform_delivery: Boolean(user.needs_platform_delivery)
-            }
+            user: { id: user.id, name: user.name, email: user.email, role: user.role }
         });
     } catch (err) {
         console.error('LOGIN ERROR:', err);
@@ -373,28 +366,29 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// --- MARKETPLACE & PRODUCT ENDPOINTS ---
+// --- MARKETPLACE & SEARCH ENDPOINTS ---
 
-// Fetch products with optional search query filter (?q=keyword)
+// GET /api/products (Supports ?search= query string)
 app.get('/api/products', async (req, res) => {
-    const searchQuery = req.query.q;
+    const { search } = req.query;
+
     try {
-        let queryStr = `
-            SELECT p.id, p.title, p.description, p.price, p.created_at, u.name AS seller_name, u.needs_platform_delivery
+        let query = `
+            SELECT p.id, p.title, p.description, p.price, p.created_at, u.name AS seller_name 
             FROM products p 
             JOIN users u ON p.seller_id = u.id 
         `;
-        let params = [];
+        let queryParams = [];
 
-        if (searchQuery && searchQuery.trim() !== '') {
-            queryStr += ` WHERE p.title LIKE ? OR p.description LIKE ?`;
-            const term = `%${searchQuery.trim()}%`;
-            params.push(term, term);
+        if (search && search.trim() !== '') {
+            query += ` WHERE p.title LIKE ? OR p.description LIKE ?`;
+            const searchPattern = `%${search.trim()}%`;
+            queryParams.push(searchPattern, searchPattern);
         }
 
-        queryStr += ` ORDER BY p.created_at DESC`;
+        query += ` ORDER BY p.created_at DESC`;
 
-        const [products] = await db.query(queryStr, params);
+        const [products] = await db.query(query, queryParams);
 
         for (let p of products) {
             const [imgs] = await db.query('SELECT image_url FROM product_images WHERE product_id = ?', [p.id]);
@@ -412,7 +406,7 @@ app.get('/api/products', async (req, res) => {
 app.get('/api/products/:id', async (req, res) => {
     try {
         const [products] = await db.query(`
-            SELECT p.id, p.title, p.description, p.price, p.created_at, u.name AS seller_name, u.needs_platform_delivery
+            SELECT p.id, p.title, p.description, p.price, p.created_at, u.name AS seller_name 
             FROM products p 
             JOIN users u ON p.seller_id = u.id 
             WHERE p.id = ?
@@ -464,6 +458,25 @@ app.post('/api/products', authenticateToken, async (req, res) => {
         console.error('CREATE PRODUCT ERROR:', err);
         res.status(500).json({ error: 'Database error', details: err.message });
     }
+});
+
+// --- RETURN POLICY & TERMS & CONDITIONS ENDPOINTS ---
+
+app.get('/api/return-policy', (req, res) => {
+    res.json({
+        title: 'WeBuy Return & Refund Policy',
+        policy: [
+            'Items can be returned within 7 days of receipt.',
+            'Products must be unused, undamaged, and in original packaging.',
+            'Buyers are responsible for return shipping unless the item was defective or incorrect.',
+            'Refunds will be processed to the original payment method after seller inspection.',
+            'A mandatory R50 advertisement and administrative fee per product applies for registered business listings.'
+        ],
+        seller_terms: {
+            delivery_fee_platform: 'R400 per KG for platform-managed delivery.',
+            ad_fee_per_product: 'R50 charge per product sold for site advertisement and platform maintenance.'
+        }
+    });
 });
 
 // --- CART ENDPOINTS ---
@@ -593,7 +606,6 @@ app.post('/api/payat/checkout', authenticateToken, async (req, res) => {
     }
 });
 
-// Pay@ Webhook Notification Endpoint (Triggers Seller Email)
 app.post('/api/payat/notification', async (req, res) => {
     const { payat_reference, status } = req.body;
 
@@ -628,22 +640,6 @@ app.get('/api/payat/status/:reference', authenticateToken, async (req, res) => {
     } catch (err) {
         res.status(500).json({ error: 'Database error', details: err.message });
     }
-});
-
-// --- RETURN POLICY ENDPOINT ---
-
-app.get('/api/return-policy', (req, res) => {
-    res.json({
-        title: "WeBuy Return & Refund Policy",
-        effectiveDate: "2026-01-01",
-        policy: [
-            "1. Standard Return Window: Buyers may request a return within 7 calendar days of receipt of the item.",
-            "2. Condition Requirements: Items must be returned in their original condition, unused, and with all original packaging.",
-            "3. Delivery Costs for Returns: If an item is defective or incorrect, WeBuy will handle return shipping fees. For change-of-mind returns, the buyer is responsible for return transport costs.",
-            "4. Platform & Ad Fees: Seller advertising charges (R50 per item sold) are non-refundable once an order is processed.",
-            "5. Processing Time: Refunds will be issued back via original payment methods or EFT within 3-5 business days of item inspection."
-        ]
-    });
 });
 
 const PORT = process.env.PORT || 3000;
