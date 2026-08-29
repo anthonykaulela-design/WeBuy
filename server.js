@@ -1,29 +1,31 @@
-requirequire('dotenv').config();
+require('dotenv').config();
 const express = require('express');
 const mysql = require('mysql2/promise');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
 
 const app = express();
 
+// Enable CORS for all routes
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
+// Increase payload limits to handle uploaded business certificates and images
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+// Database connection configuration
 const db = mysql.createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
+    host: process.env.DB_HOST || 'localhost',
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
     database: process.env.DB_NAME || 'webuy',
-    port: process.env.DB_PORT || 4000,
-    ssl: { minVersion: 'TLSv1.2', rejectUnauthorized: false },
+    port: process.env.DB_PORT || 3306,
+    ssl: process.env.DB_SSL === 'true' ? { minVersion: 'TLSv1.2', rejectUnauthorized: false } : null,
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
@@ -32,21 +34,13 @@ const db = mysql.createPool({
 const JWT_SECRET = process.env.JWT_SECRET || 'webuy_secret_key_2026';
 const PAYAT_SYSTEM_ID = process.env.PAYAT_SYSTEM_ID || 'WEBUY001';
 
-const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST || 'smtp.gmail.com',
-    port: parseInt(process.env.SMTP_PORT || '587'),
-    secure: false,
-    auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS
-    }
-});
-
+// Initialize Database Tables & Schema Updates
 async function initDatabase() {
     try {
         const conn = await db.getConnection();
-        console.log('Connected to TiDB/MySQL database.');
+        console.log('Connected to Database.');
 
+        // 1. Users table (stores seller registration certs, delivery choices, T&C acceptances)
         await conn.query(`
             CREATE TABLE IF NOT EXISTS users (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -61,16 +55,17 @@ async function initDatabase() {
             );
         `);
 
-        // Migration for existing tables
-        const sellerColumns = [
+        // Migration checks if columns already exist on an active DB
+        const alterQueries = [
             'ALTER TABLE users ADD COLUMN business_cert LONGTEXT NULL;',
             "ALTER TABLE users ADD COLUMN delivery_preference ENUM('self', 'platform') NULL;",
             'ALTER TABLE users ADD COLUMN accepted_tc TINYINT(1) DEFAULT 0;'
         ];
-        for (let q of sellerColumns) {
-            try { await conn.query(q); } catch (e) {}
+        for (let q of alterQueries) {
+            try { await conn.query(q); } catch (e) { /* Column exists */ }
         }
 
+        // 2. Products table
         await conn.query(`
             CREATE TABLE IF NOT EXISTS products (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -83,6 +78,7 @@ async function initDatabase() {
             );
         `);
 
+        // 3. Product Images table
         await conn.query(`
             CREATE TABLE IF NOT EXISTS product_images (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -92,6 +88,7 @@ async function initDatabase() {
             );
         `);
 
+        // 4. Cart Items table
         await conn.query(`
             CREATE TABLE IF NOT EXISTS cart_items (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -104,6 +101,7 @@ async function initDatabase() {
             );
         `);
 
+        // 5. Orders table
         await conn.query(`
             CREATE TABLE IF NOT EXISTS orders (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -125,6 +123,7 @@ async function initDatabase() {
             );
         `);
 
+        // 6. Order Items table
         await conn.query(`
             CREATE TABLE IF NOT EXISTS order_items (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -138,7 +137,7 @@ async function initDatabase() {
         `);
 
         conn.release();
-        console.log('Database schema verified.');
+        console.log('Database initialization complete.');
     } catch (err) {
         console.error('DATABASE INIT ERROR:', err.message);
     }
@@ -146,36 +145,38 @@ async function initDatabase() {
 
 initDatabase();
 
+// JWT Authentication Middleware
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
-    if (!token) return res.status(401).json({ error: 'Access token missing' });
+    if (!token) return res.status(401).json({ error: 'Access token required' });
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ error: 'Invalid token' });
+        if (err) return res.status(403).json({ error: 'Invalid or expired token' });
         req.user = user;
         next();
     });
 };
 
-// --- AUTHENTICATION ---
+// --- AUTHENTICATION & REGISTRATION ENDPOINTS ---
 
 app.post('/api/auth/register', async (req, res) => {
     const { name, email, password, role, businessCert, deliveryPreference, acceptedTC } = req.body;
 
     if (!name || !email || !password || !role) {
-        return res.status(400).json({ error: 'All primary fields are required.' });
+        return res.status(400).json({ error: 'Name, email, password, and role are required.' });
     }
 
+    // Validation for Seller Requirements
     if (role === 'seller') {
         if (!businessCert) {
-            return res.status(400).json({ error: 'Business registration certificate is required for sellers.' });
+            return res.status(400).json({ error: 'Business Registration Certificate is required for seller registration.' });
         }
         if (!deliveryPreference) {
-            return res.status(400).json({ error: 'Please specify your delivery handling preference.' });
+            return res.status(400).json({ error: 'Please specify whether you will handle delivery or need platform delivery.' });
         }
         if (!acceptedTC) {
-            return res.status(400).json({ error: 'You must accept the Terms and Conditions to register as a seller.' });
+            return res.status(400).json({ error: 'You must accept the seller Terms & Conditions (R50 ad fee & R400/kg delivery terms).' });
         }
     }
 
@@ -186,23 +187,24 @@ app.post('/api/auth/register', async (req, res) => {
         }
 
         const hashedPassword = await bcrypt.hash(password, 10);
+
         const [result] = await db.query(
             `INSERT INTO users (name, email, password, role, business_cert, delivery_preference, accepted_tc) 
              VALUES (?, ?, ?, ?, ?, ?, ?)`,
             [
-                name, 
-                email, 
-                hashedPassword, 
-                role.toLowerCase(), 
-                role === 'seller' ? businessCert : null, 
-                role === 'seller' ? deliveryPreference : null, 
+                name,
+                email,
+                hashedPassword,
+                role.toLowerCase(),
+                role === 'seller' ? businessCert : null,
+                role === 'seller' ? deliveryPreference : null,
                 role === 'seller' ? (acceptedTC ? 1 : 0) : 0
             ]
         );
 
         res.status(201).json({ message: 'User registered successfully', userId: result.insertId });
     } catch (err) {
-        res.status(500).json({ error: 'Database error', details: err.message });
+        res.status(500).json({ error: 'Registration error', details: err.message });
     }
 });
 
@@ -210,11 +212,11 @@ app.post('/api/auth/login', async (req, res) => {
     const { email, password } = req.body;
     try {
         const [users] = await db.query('SELECT * FROM users WHERE email = ?', [email]);
-        if (users.length === 0) return res.status(400).json({ error: 'Invalid credentials.' });
+        if (users.length === 0) return res.status(400).json({ error: 'Invalid email or password.' });
 
         const user = users[0];
         const validPassword = await bcrypt.compare(password, user.password);
-        if (!validPassword) return res.status(400).json({ error: 'Invalid credentials.' });
+        if (!validPassword) return res.status(400).json({ error: 'Invalid email or password.' });
 
         const token = jwt.sign(
             { id: user.id, email: user.email, role: user.role, name: user.name },
@@ -228,11 +230,11 @@ app.post('/api/auth/login', async (req, res) => {
             user: { id: user.id, name: user.name, email: user.email, role: user.role }
         });
     } catch (err) {
-        res.status(500).json({ error: 'Database error', details: err.message });
+        res.status(500).json({ error: 'Login error', details: err.message });
     }
 });
 
-// --- MARKETPLACE & PRODUCTS (WITH SEARCH) ---
+// --- PRODUCTS & SEARCH API ---
 
 app.get('/api/products', async (req, res) => {
     const search = req.query.search || '';
@@ -244,10 +246,11 @@ app.get('/api/products', async (req, res) => {
         `;
         let queryParams = [];
 
+        // Enable product search filter across title and description
         if (search.trim() !== '') {
             query += ` WHERE p.title LIKE ? OR p.description LIKE ?`;
-            const searchTerm = `%${search.trim()}%`;
-            queryParams.push(searchTerm, searchTerm);
+            const term = `%${search.trim()}%`;
+            queryParams.push(term, term);
         }
 
         query += ` ORDER BY p.created_at DESC`;
@@ -262,7 +265,7 @@ app.get('/api/products', async (req, res) => {
 
         res.json(products);
     } catch (err) {
-        res.status(500).json({ error: 'Database error', details: err.message });
+        res.status(500).json({ error: 'Failed to fetch products', details: err.message });
     }
 });
 
@@ -284,13 +287,13 @@ app.get('/api/products/:id', async (req, res) => {
 
         res.json(product);
     } catch (err) {
-        res.status(500).json({ error: 'Database error', details: err.message });
+        res.status(500).json({ error: 'Failed to fetch product', details: err.message });
     }
 });
 
 app.post('/api/products', authenticateToken, async (req, res) => {
     if (req.user.role !== 'seller') {
-        return res.status(403).json({ error: 'Only sellers can list products.' });
+        return res.status(403).json({ error: 'Only registered sellers can publish products.' });
     }
 
     const { title, description, price, images } = req.body;
@@ -310,13 +313,13 @@ app.post('/api/products', authenticateToken, async (req, res) => {
             }
         }
 
-        res.status(201).json({ message: 'Product created successfully', productId });
+        res.status(201).json({ message: 'Product published successfully', productId });
     } catch (err) {
-        res.status(500).json({ error: 'Database error', details: err.message });
+        res.status(500).json({ error: 'Failed to publish product', details: err.message });
     }
 });
 
-// --- CART & CHECKOUT ---
+// --- SHOPPING CART API ---
 
 app.get('/api/cart', authenticateToken, async (req, res) => {
     try {
@@ -346,7 +349,7 @@ app.post('/api/cart', authenticateToken, async (req, res) => {
         }
         res.json({ message: 'Item added to cart' });
     } catch (err) {
-        res.status(500).json({ error: 'Cart error', details: err.message });
+        res.status(500).json({ error: 'Cart update error', details: err.message });
     }
 });
 
@@ -355,16 +358,18 @@ app.delete('/api/cart/:id', authenticateToken, async (req, res) => {
         await db.query('DELETE FROM cart_items WHERE id = ? AND buyer_id = ?', [req.params.id, req.user.id]);
         res.json({ message: 'Item removed from cart' });
     } catch (err) {
-        res.status(500).json({ error: 'Remove error', details: err.message });
+        res.status(500).json({ error: 'Cart deletion error', details: err.message });
     }
 });
 
+// --- CHECKOUT & PAY@ PAYMENT PROCESS ---
+
 app.post('/api/payat/checkout', authenticateToken, async (req, res) => {
-    if (req.user.role !== 'buyer') return res.status(403).json({ error: 'Only buyers can perform checkout.' });
+    if (req.user.role !== 'buyer') return res.status(403).json({ error: 'Only buyers can checkout.' });
     const { payment_method, full_name, company_name, address, city, province, postal_code, phone_number } = req.body;
 
     if (!full_name || !address || !city || !province || !postal_code || !phone_number) {
-        return res.status(400).json({ error: 'Delivery details required.' });
+        return res.status(400).json({ error: 'Missing required delivery address fields.' });
     }
 
     try {
@@ -375,7 +380,7 @@ app.post('/api/payat/checkout', authenticateToken, async (req, res) => {
             WHERE c.buyer_id = ?
         `, [req.user.id]);
 
-        if (cartItems.length === 0) return res.status(400).json({ error: 'Your cart is empty.' });
+        if (cartItems.length === 0) return res.status(400).json({ error: 'Cart is empty.' });
 
         let totalAmount = cartItems.reduce((sum, item) => sum + (parseFloat(item.price) * item.quantity), 0);
         const payatRef = `10101${Date.now().toString().slice(-6)}${Math.floor(10 + Math.random() * 90)}`;
@@ -394,16 +399,16 @@ app.post('/api/payat/checkout', authenticateToken, async (req, res) => {
         await db.query('DELETE FROM cart_items WHERE buyer_id = ?', [req.user.id]);
 
         res.status(201).json({
-            message: 'Order created',
+            message: 'Order created successfully',
             orderId: orderRes.insertId,
             payatReference: payatRef,
             totalAmount: totalAmount.toFixed(2),
             paymentUrl: `https://payat.io/pay/${payatRef}?amount=${totalAmount.toFixed(2)}&sys=${PAYAT_SYSTEM_ID}`
         });
     } catch (err) {
-        res.status(500).json({ error: 'Checkout failed', details: err.message });
+        res.status(500).json({ error: 'Checkout error', details: err.message });
     }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`WeBuy API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`WeBuy backend server running on port ${PORT}`));
