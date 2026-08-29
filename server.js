@@ -17,7 +17,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' })); // Support large base64 image strings
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Database Connection Pool (TiDB / MySQL)
+// Database Connection Pool (TiDB / MySQL with SSL enabled)
 const db = mysql.createPool({
     host: process.env.DB_HOST || 'localhost',
     user: process.env.DB_USER || 'root',
@@ -26,9 +26,11 @@ const db = mysql.createPool({
     port: process.env.DB_PORT || 4000,
     waitForConnections: true,
     connectionLimit: 10,
-    queueLimit: 0
+    queueLimit: 0,
+    ssl: {
+        rejectUnauthorized: true
+    }
 });
-
 // Test DB Connection on Startup
 db.getConnection()
     .then(connection => {
