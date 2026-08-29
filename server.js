@@ -145,57 +145,35 @@ app.get('/api/products', async (req, res) => {
             ORDER BY p.id DESC
         `);
 
-        const products = rows.map(p => ({ ...p, images: parseImages(p.images) }));
+        const products = rows.map(p => {
+            let parsedImages = [];
+            try {
+                if (p.images) {
+                    if (Array.isArray(p.images)) {
+                        parsedImages = p.images;
+                    } else if (typeof p.images === 'string') {
+                        const trimmed = p.images.trim();
+                        if (trimmed.startsWith('[') || trimmed.startsWith('{')) {
+                            const temp = JSON.parse(trimmed);
+                            parsedImages = Array.isArray(temp) ? temp : [temp];
+                        } else {
+                            parsedImages = [trimmed];
+                        }
+                    }
+                }
+            } catch (e) {
+                parsedImages = p.images ? [String(p.images)] : [];
+            }
+
+            return { ...p, images: parsedImages };
+        });
+
         res.json(products);
     } catch (err) {
         console.error('Fetch products error:', err);
         res.status(500).json({ error: 'Failed to retrieve products: ' + err.message });
     }
 });
-
-app.post('/api/products', authenticateToken, async (req, res) => {
-    try {
-        if (req.user.role !== 'seller') {
-            return res.status(403).json({ error: 'Access denied. Only sellers can list products.' });
-        }
-
-        const { title, name, description, price, weight, images } = req.body;
-        const productTitle = title || name;
-
-        if (!productTitle || price === undefined || price === null || price === '') {
-            return res.status(400).json({ error: 'Product name and price are required.' });
-        }
-
-        const sellerId = req.user.id;
-        const [sellerInfo] = await db.execute('SELECT pricing_preference FROM users WHERE id = ?', [sellerId]);
-        let finalPrice = parseFloat(price);
-
-        if (sellerInfo.length > 0 && sellerInfo[0].pricing_preference === 'add') {
-            finalPrice += 50;
-        }
-
-        let rawImages = parseImages(images);
-        if (rawImages.length > 10) rawImages = rawImages.slice(0, 10);
-
-        const [result] = await db.execute(
-            `INSERT INTO products (seller_id, title, description, price, weight, images) VALUES (?, ?, ?, ?, ?, ?)`,
-            [
-                sellerId, 
-                productTitle, 
-                description || '', 
-                finalPrice, 
-                weight ? parseFloat(weight) : 0.00, 
-                JSON.stringify(rawImages)
-            ]
-        );
-
-        res.status(201).json({ message: 'Product created successfully', productId: result.insertId });
-    } catch (err) {
-        console.error('Create product error:', err);
-        res.status(500).json({ error: 'Failed to create product: ' + err.message });
-    }
-});
-
 // CART
 app.get('/api/cart', authenticateToken, async (req, res) => {
     try {
