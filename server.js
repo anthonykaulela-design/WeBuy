@@ -31,13 +31,17 @@ db.getConnection()
     })
     .catch(err => console.error('Database connection error:', err.message));
 
-// Helper: Safely parse images array or string
+// Safe Image Parser Helper
 const parseImages = (imagesData) => {
     if (!imagesData) return [];
     if (Array.isArray(imagesData)) return imagesData;
     if (typeof imagesData === 'string') {
-        try { return JSON.parse(imagesData); } 
-        catch (e) { return [imagesData]; }
+        try { 
+            const parsed = JSON.parse(imagesData);
+            return Array.isArray(parsed) ? parsed : [parsed];
+        } catch (e) { 
+            return [imagesData]; 
+        }
     }
     return [];
 };
@@ -145,7 +149,7 @@ app.get('/api/products', async (req, res) => {
         res.json(products);
     } catch (err) {
         console.error('Fetch products error:', err);
-        res.status(500).json({ error: 'Failed to retrieve products.' });
+        res.status(500).json({ error: 'Failed to retrieve products: ' + err.message });
     }
 });
 
