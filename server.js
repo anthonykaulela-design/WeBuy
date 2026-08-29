@@ -174,6 +174,27 @@ app.get('/api/products', async (req, res) => {
         res.status(500).json({ error: 'Failed to retrieve products: ' + err.message });
     }
 });
+
+
+// ADD PRODUCT
+app.post('/api/products', async (req, res) => {
+    try {
+        const { seller_id, title, description, price, weight, images } = req.body;
+        
+        // Convert images array to JSON string if it's an array
+        const imagesString = Array.isArray(images) ? JSON.stringify(images) : images;
+
+        const [result] = await db.execute(
+            `INSERT INTO products (seller_id, title, description, price, weight, images) VALUES (?, ?, ?, ?, ?, ?)`,
+            [seller_id || 1, title, description, price, weight || 0, imagesString]
+        );
+
+        res.status(201).json({ message: 'Product created successfully', productId: result.insertId });
+    } catch (err) {
+        console.error('Create product error:', err);
+        res.status(500).json({ error: 'Failed to create product: ' + err.message });
+    }
+});
 // CART
 app.get('/api/cart', authenticateToken, async (req, res) => {
     try {
