@@ -7,12 +7,11 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 
-// Increase payload limits to handle Base64 certificate and multi-image uploads
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(cors());
 
-// MySQL / TiDB Database Connection Pool
+// Database Connection Pool
 const db = mysql.createPool({
     host: process.env.DB_HOST,
     user: process.env.DB_USER,
@@ -25,7 +24,6 @@ const db = mysql.createPool({
     ssl: { rejectUnauthorized: false }
 });
 
-// Verify Database Connection
 db.getConnection()
     .then(conn => {
         console.log('Successfully connected to TiDB/MySQL database');
@@ -33,7 +31,7 @@ db.getConnection()
     })
     .catch(err => console.error('Database connection error:', err.message));
 
-// Helper: Image parser safeguard
+// Helper: Safely parse images array or string
 const parseImages = (imagesData) => {
     if (!imagesData) return [];
     if (Array.isArray(imagesData)) return imagesData;
@@ -61,7 +59,7 @@ const authenticateToken = (req, res, next) => {
     }
 };
 
-// SYSTEM & HEALTH
+// HEALTH
 app.get('/api/health', async (req, res) => {
     try {
         const conn = await db.getConnection();
@@ -86,12 +84,20 @@ app.post(['/api/auth/register', '/api/register'], async (req, res) => {
 
         const hashedPassword = await bcrypt.hash(password, 10);
         const userRole = role === 'seller' ? 'seller' : 'buyer';
-        const isTermsAccepted = userRole === 'seller' ? 1 : 0;
 
         const [result] = await db.execute(
             `INSERT INTO users (name, email, password, role, business_cert, delivery_preference, pricing_preference, terms_accepted) 
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-            [name, email, hashedPassword, userRole, business_cert || null, delivery_preference || 'self', pricing_preference || 'keep', isTermsAccepted]
+            [
+                name, 
+                email, 
+                hashedPassword, 
+                userRole, 
+                business_cert || null, 
+                delivery_preference || 'self', 
+                pricing_preference || 'keep', 
+                userRole === 'seller' ? 1 : 0
+            ]
         );
 
         res.status(201).json({ message: 'User registered successfully', userId: result.insertId });
@@ -129,7 +135,7 @@ app.post(['/api/auth/login', '/api/login'], async (req, res) => {
 app.get('/api/products', async (req, res) => {
     try {
         const [rows] = await db.execute(`
-            SELECT p.*, u.name as seller_name 
+            SELECT p.id, p.seller_id, p.title, p.description, p.price, p.weight, p.images, p.created_at, u.name as seller_name 
             FROM products p 
             LEFT JOIN users u ON p.seller_id = u.id 
             ORDER BY p.id DESC
@@ -138,6 +144,7 @@ app.get('/api/products', async (req, res) => {
         const products = rows.map(p => ({ ...p, images: parseImages(p.images) }));
         res.json(products);
     } catch (err) {
+        console.error('Fetch products error:', err);
         res.status(500).json({ error: 'Failed to retrieve products.' });
     }
 });
@@ -151,7 +158,7 @@ app.post('/api/products', authenticateToken, async (req, res) => {
         const { title, name, description, price, weight, images } = req.body;
         const productTitle = title || name;
 
-        if (!productTitle || price === undefined) {
+        if (!productTitle || price === undefined || price === null || price === '') {
             return res.status(400).json({ error: 'Product name and price are required.' });
         }
 
@@ -168,7 +175,14 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 
         const [result] = await db.execute(
             `INSERT INTO products (seller_id, title, description, price, weight, images) VALUES (?, ?, ?, ?, ?, ?)`,
-            [sellerId, productTitle, description || '', finalPrice, weight ? parseFloat(weight) : 0.00, JSON.stringify(rawImages)]
+            [
+                sellerId, 
+                productTitle, 
+                description || '', 
+                finalPrice, 
+                weight ? parseFloat(weight) : 0.00, 
+                JSON.stringify(rawImages)
+            ]
         );
 
         res.status(201).json({ message: 'Product created successfully', productId: result.insertId });
@@ -182,16 +196,24 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 app.get('/api/cart', authenticateToken, async (req, res) => {
     try {
         const [rows] = await db.execute(`
-            SELECT c.id as cart_id, c.quantity, p.id as product_id, p.title, p.price, p.images, p.weight
+            SELECT 
+                c.id AS cart_id, 
+                c.quantity, 
+                p.id AS product_id, 
+                p.title, 
+                p.price, 
+                p.images, 
+                p.weight
             FROM cart c 
-            JOIN products p ON c.product_id = p.id 
+            INNER JOIN products p ON c.product_id = p.id 
             WHERE c.user_id = ?
         `, [req.user.id]);
 
         const cartItems = rows.map(item => ({ ...item, images: parseImages(item.images) }));
         res.json(cartItems);
     } catch (err) {
-        res.status(500).json({ error: 'Failed to load cart.' });
+        console.error('Fetch cart error:', err);
+        res.status(500).json({ error: 'Failed to load cart: ' + err.message });
     }
 });
 
@@ -212,6 +234,7 @@ app.post('/api/cart', authenticateToken, async (req, res) => {
 
         res.json({ message: 'Added to cart successfully' });
     } catch (err) {
+        console.error('Add to cart error:', err);
         res.status(500).json({ error: 'Failed to add item to cart.' });
     }
 });
@@ -221,6 +244,7 @@ app.delete('/api/cart/:id', authenticateToken, async (req, res) => {
         await db.execute('DELETE FROM cart WHERE id = ? AND user_id = ?', [req.params.id, req.user.id]);
         res.json({ message: 'Cart item removed successfully' });
     } catch (err) {
+        console.error('Remove cart item error:', err);
         res.status(500).json({ error: 'Failed to remove cart item.' });
     }
 });
@@ -230,8 +254,10 @@ app.post(['/api/payat/checkout', '/api/checkout/payat'], authenticateToken, asyn
     try {
         const userId = req.user.id;
         const [cartItems] = await db.execute(`
-            SELECT c.quantity, p.id as product_id, p.price, p.weight 
-            FROM cart c JOIN products p ON c.product_id = p.id WHERE c.user_id = ?
+            SELECT c.quantity, p.id AS product_id, p.price, p.weight 
+            FROM cart c 
+            INNER JOIN products p ON c.product_id = p.id 
+            WHERE c.user_id = ?
         `, [userId]);
 
         if (cartItems.length === 0) return res.status(400).json({ error: 'Your cart is empty.' });
@@ -259,6 +285,7 @@ app.post(['/api/payat/checkout', '/api/checkout/payat'], authenticateToken, asyn
             total_amount: totalAmount
         });
     } catch (err) {
+        console.error('Checkout error:', err);
         res.status(500).json({ error: 'Checkout failed.' });
     }
 });
@@ -278,6 +305,7 @@ app.post('/api/payat/notification', async (req, res) => {
 
         res.json({ status: 'ACCEPTED', payat_reference: targetRef });
     } catch (err) {
+        console.error('Webhook error:', err);
         res.status(500).json({ error: 'Webhook processing failed.' });
     }
 });
@@ -292,6 +320,7 @@ app.get('/api/payat/status/:reference', authenticateToken, async (req, res) => {
         if (orders.length === 0) return res.status(404).json({ error: 'Order not found.' });
         res.json(orders[0]);
     } catch (err) {
+        console.error('Status check error:', err);
         res.status(500).json({ error: 'Status check failed.' });
     }
 });
