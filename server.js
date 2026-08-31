@@ -285,7 +285,6 @@ app.post('/api/payat/checkout', authenticateToken, async (req, res) => {
         const payatReference = 'WB' + Math.floor(100000000 + Math.random() * 900000000);
         const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString().slice(0, 19).replace('T', ' ');
 
-        // Save order to database so Pay@ till systems can query it via Enquiry endpoint
         await db.execute(
             `INSERT INTO orders (user_id, reference, amount, status, channel_type, expires_at) 
              VALUES (?, ?, ?, 'PENDING', ?, ?)`,
@@ -313,8 +312,16 @@ app.post('/api/payat/checkout', authenticateToken, async (req, res) => {
 });
 
 /**
- * PAY@ ONLINE ISSUER INTERFACE ENDPOINTS (Called directly by Retail Point of Sale Systems)
+ * PAY@ ONLINE ISSUER INTERFACE ENDPOINTS (Called directly by Retail POS Systems)
  */
+
+// Browser-friendly GET status route for /api/payat/
+app.get('/api/payat/', (req, res) => {
+    res.status(200).json({
+        status: 'ONLINE',
+        message: 'WeBuy Pay@ Issuer Interface gateway is running. Use POST requests for integration endpoints.'
+    });
+});
 
 // 1. Echo Test
 app.post('/api/payat/echo', (req, res) => {
